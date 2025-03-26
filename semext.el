@@ -9,6 +9,7 @@
 ;;; Code:
 
 (require 'llm)
+(require 'seq)
 
 (defvar semext-provider nil
   "The LLM provider to use for semext functionality.
@@ -91,20 +92,35 @@ Return the result as a JSON object."
                       (setq semext--part-points (nreverse points))))
                   (lambda (_ err) (message "Error getting semantic parts via semext: %s" err))))
 
+(defun semext--part-points ()
+  "Return `semext--part-points', populating it if necessary."
+  (or semext--part-points
+      (progn
+        (semext--populate-parts)
+        (while (null semext--part-points)
+          (sit-for 0.1)))))
+
 (defun semext-forward-part (&optional n)
   "Move point forward to the beginning of the next part."
   (interactive "p")
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
-  (let* ((points (or semext--part-points
-                     (progn
-                       (semext--populate-parts)
-                       (while (null semext--part-points)
-                         (sit-for 0.1)))))
+  (let* ((points (semext--part-points))
          (next-point (seq-find (lambda (point) (> point (point)))
                                semext--part-points)))
     (when next-point
       (goto-char next-point))))
+
+(defun semext-backward-part (&optional n)
+  "Move point backward to the beginning of the previous part."
+  (interactive "p")
+  (unless (member 'json-response (llm-capabilities semext-provider))
+    (error "semext requires a provider that can do json responses"))
+  (let* ((points (semext--part-points))
+         (prev-point (seq-find (lambda (point) (< point (point)))
+                               (reverse semext--part-points))))
+    (when prev-point
+      (goto-char prev-point))))
 
 (provide 'semext)
 ;;; semext.el ends here
