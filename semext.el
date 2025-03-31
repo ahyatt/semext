@@ -48,8 +48,8 @@ Return the result as a JSON object."
                                             :required  ["parts"])
   "The JSON schema we expect to get back in our LLM requests.")
 
-(defvar-local semext--part-points nil
-  "The stored points representing the start of a pointhave the buffer text with line numbershave the buffer text with line numbers.")
+(defvar-local semext--part-markers nil
+  "The stored markers representing the start of semantic parts in the buffer.")
 
 (defun semext--buffer-text ()
   "Return the buffer text with line numbers prepended to each line."
@@ -88,39 +88,40 @@ Return the result as a JSON object."
                             (forward-line (1- line-num))
                             (when (search-forward start-chars (line-end-position) t)
                               (backward-char (length start-chars))
-                              (push (point) points)))))
-                      (setq semext--part-points (nreverse points))))
+                              (push (point-marker) points)))))
+                      (setq semext--part-markers (nreverse points))))
                   (lambda (_ err) (message "Error getting semantic parts via semext: %s" err))))
 
-(defun semext--part-points ()
-  "Return `semext--part-points', populating it if necessary."
-  (or semext--part-points
+(defun semext--part-markers ()
+  "Return `semext--part-markers', populating it if necessary."
+  (or semext--part-markers
       (progn
         (semext--populate-parts)
-        (while (null semext--part-points)
-          (sit-for 0.1)))))
+        (while (null semext--part-markers)
+          (sit-for 0.1))
+        semext--part-markers)))
 
 (defun semext-forward-part (&optional n)
   "Move point forward to the beginning of the next part."
   (interactive "p")
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
-  (let* ((points (semext--part-points))
-         (next-point (seq-find (lambda (point) (> point (point)))
-                               semext--part-points)))
-    (when next-point
-      (goto-char next-point))))
+  (let* ((markers (semext--part-markers))
+         (next-marker (seq-find (lambda (marker) (> marker (point)))
+                                markers)))
+    (when next-marker
+      (goto-char next-marker))))
 
 (defun semext-backward-part (&optional n)
   "Move point backward to the beginning of the previous part."
   (interactive "p")
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
-  (let* ((points (semext--part-points))
-         (prev-point (seq-find (lambda (point) (< point (point)))
-                               (reverse semext--part-points))))
-    (when prev-point
-      (goto-char prev-point))))
+  (let* ((markers (semext--part-markers))
+         (prev-marker (seq-find (lambda (marker) (< marker (point)))
+                                (reverse markers))))
+    (when prev-marker
+      (goto-char prev-marker))))
 
 (provide 'semext)
 ;;; semext.el ends here
