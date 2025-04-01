@@ -11,6 +11,30 @@
 (require 'llm)
 (require 'seq)
 
+(defgroup semext nil
+  "Semantic extensions to Emacs functionality."
+  :group 'convenience)
+
+(defcustom semext-chunk-size 500
+  "Number of lines to send to the LLM at once.
+Larger values may provide better semantic understanding but require
+more LLM context window space."
+  :type 'integer
+  :group 'semext)
+
+(defcustom semext-chunk-overlap 10
+  "Number of lines to overlap between chunks.
+This helps maintain context between chunks."
+  :type 'integer
+  :group 'semext)
+
+(defcustom semext-preload-threshold 20
+  "Number of lines before the end of a processed region to trigger loading the next chunk.
+When the point is within this many lines of the end of a processed region,
+the next chunk will be loaded."
+  :type 'integer
+  :group 'semext)
+
 (defvar semext-provider nil
   "The LLM provider to use for semext functionality.
 This should be a provider that can do json responses, and is relatively
@@ -51,77 +75,261 @@ Return the result as a JSON object."
 (defvar-local semext--part-markers nil
   "The stored markers representing the start of semantic parts in the buffer.")
 
-(defun semext--buffer-text ()
-  "Return the buffer text with line numbers prepended to each line."
+(defvar-local semext--processed-regions nil
+  "List of regions that have been processed.
+Each element is a cons cell (START . END) representing buffer positions.")
+
+(defvar-local semext--processing-in-progress nil
+  "Non-nil when a chunk is currently being processed.")
+
+(defun semext--buffer-text (&optional start end)
+  "Return the buffer text with line numbers prepended to each line.
+If START and END are provided, only return text between those positions."
   (let ((lines nil)
-        (line-num 1))
+        (line-num 1)
+        (start-line-num 1))
     (save-excursion
       (goto-char (point-min))
-      (while (not (eobp))
+      ;; Count lines until START if provided
+      (when start
+        (while (and (< (point) start) (not (eobp)))
+          (setq line-num (1+ line-num))
+          (forward-line 1))
+        (setq start-line-num line-num))
+      ;; If END is provided, collect lines until END
+      ;; Otherwise collect all lines
+      (while (and (if end (< (point) end) t)
+                  (not (eobp)))
         (let ((line (buffer-substring-no-properties
                      (line-beginning-position)
                      (line-end-position))))
           (push (format "%d: %s" line-num line) lines)
           (setq line-num (1+ line-num))
           (forward-line 1))))
-    (string-join (nreverse lines) "\n")))
+    (cons start-line-num (string-join (nreverse lines) "\n"))))
 
-(defun semext--populate-parts ()
-  "Return points of all part start positions in the buffer."
+(defun semext--get-chunk-bounds (point)
+  "Get the start and end positions for a chunk centered around POINT."
+  (save-excursion
+    (goto-char point)
+    ;; Move to line beginning
+    (beginning-of-line)
+    ;; Calculate half chunk size (with overlap consideration)
+    (let* ((half-chunk (/ semext-chunk-size 2))
+           (chunk-start-line (max 1 (- (line-number-at-pos) half-chunk)))
+           (chunk-end-line (+ chunk-start-line semext-chunk-size))
+           chunk-start chunk-end)
+
+      ;; Find start position
+      (goto-char (point-min))
+      (forward-line (1- chunk-start-line))
+      (setq chunk-start (point))
+
+      ;; Find end position
+      (goto-char (point-min))
+      (forward-line (1- chunk-end-line))
+      (if (eobp)
+          (setq chunk-end (point-max))
+        (end-of-line)
+        (setq chunk-end (point)))
+
+      (cons chunk-start chunk-end))))
+
+(defun semext--region-contains-p (region point)
+  "Return t if REGION contains POINT.
+REGION is a cons cell (START . END)."
+  (and (>= point (car region))
+       (<= point (cdr region))))
+
+(defun semext--point-in-processed-region-p (point)
+  "Return t if POINT is in a processed region."
+  (seq-some (lambda (region)
+              (semext--region-contains-p region point))
+            semext--processed-regions))
+
+(defun semext--merge-overlapping-regions (regions)
+  "Merge overlapping regions in REGIONS list."
+  (when regions
+    (let ((sorted-regions (sort (copy-sequence regions)
+                                (lambda (a b) (< (car a) (car b)))))
+          merged)
+      (push (car sorted-regions) merged)
+      (dolist (region (cdr sorted-regions))
+        (let ((last (car merged)))
+          (if (> (cdr last) (car region))
+              ;; Regions overlap, merge them
+              (setcdr last (max (cdr last) (cdr region)))
+            ;; No overlap, add as new region
+            (push region merged))))
+      (nreverse merged))))
+
+(defun semext--add-processed-region (start end)
+  "Add the region from START to END to the list of processed regions."
+  (setq semext--processed-regions
+        (semext--merge-overlapping-regions
+         (cons (cons start end) semext--processed-regions))))
+
+(defun semext--populate-parts-for-region (start end)
+  "Populate semantic parts for the region from START to END."
+  (when semext--processing-in-progress
+    (message "Already processing a chunk, skipping request")
+    (cl-return-from semext--populate-parts-for-region nil))
+
+  (setq semext--processing-in-progress t)
+  (message "Processing chunk from line %d to %d..."
+           (line-number-at-pos start)
+           (line-number-at-pos end))
 
   ;; We will ask the llm to parse the buffer and return the line number and
   ;; leading several characters of each part.
-  (llm-chat-async semext-provider
-                  (llm-make-chat-prompt (semext--buffer-text)
-                                        :context semext--parts-prompt
-                                        :response-format semext--parts-json-schema)
-                  (lambda (resp)
-                    (message "Received response: %s" resp)
-                    (let* ((json-data (json-parse-string resp :object-type 'plist :array-type 'list))
-                           (parts (plist-get json-data :parts))
-                           (points nil))
-                      (dolist (part parts)
-                        (let ((line-num (plist-get part :line_num))
-                              (start-chars (plist-get part :start_chars)))
-                          (save-excursion
-                            (goto-char (point-min))
-                            (forward-line (1- line-num))
-                            (when (search-forward start-chars (line-end-position) t)
-                              (backward-char (length start-chars))
-                              (push (point-marker) points)))))
-                      (setq semext--part-markers (nreverse points))))
-                  (lambda (_ err) (message "Error getting semantic parts via semext: %s" err))))
+  (condition-case err
+      (let* ((text-with-info (semext--buffer-text start end))
+             (start-line-num (car text-with-info))
+             (text (cdr text-with-info)))
+        (llm-chat-async
+         semext-provider
+         (llm-make-chat-prompt
+          text
+          :context (concat semext--parts-prompt
+                           "\nNote: The line numbers provided are relative to the excerpt you're analyzing.")
+          :response-format semext--parts-json-schema)
+         (lambda (resp)
+           (message "Received response from LLM for chunk")
+           (condition-case err
+               (let* ((json-data (json-parse-string resp :object-type 'plist :array-type 'list))
+                      (parts (plist-get json-data :parts))
+                      (new-markers nil))
+                 (if (not parts)
+                     (message "No parts found in LLM response for chunk")
+                   (dolist (part parts)
+                     (let ((line-num (+ (1- start-line-num) (plist-get part :line_num)))
+                           (start-chars (plist-get part :start_chars)))
+                       (save-excursion
+                         (goto-char (point-min))
+                         (forward-line (1- line-num))
+                         (when (search-forward start-chars (line-end-position) t)
+                           (backward-char (length start-chars))
+                           (push (point-marker) new-markers)))))
+                   ;; Add new markers to the existing list
+                   (setq semext--part-markers
+                         (sort (append semext--part-markers new-markers)
+                               #'<))
+                   (message "Found %d semantic parts in chunk" (length new-markers))))
+             (error
+              (message "Error processing LLM response: %s" (error-message-string err))))
+           ;; Mark region as processed and clear processing flag
+           (semext--add-processed-region start end)
+           (setq semext--processing-in-progress nil))
+         (lambda (_ err)
+           (message "Error getting semantic parts via semext: %s" err)
+           (setq semext--processing-in-progress nil))))
+    (error
+     (message "Failed to start LLM request: %s" (error-message-string err))
+     (setq semext--processing-in-progress nil))))
+
+(defun semext--populate-parts ()
+  "Populate parts for the current visible region of the buffer."
+  (let* ((bounds (semext--get-chunk-bounds (point)))
+         (start (car bounds))
+         (end (cdr bounds)))
+    (semext--populate-parts-for-region start end)))
+
+(defun semext--maybe-load-next-chunk ()
+  "Load the next chunk if we're near the end of a processed region."
+  (when (and (not semext--processing-in-progress)
+             semext--processed-regions)
+    ;; Find the region containing point
+    (let ((current-region (seq-find (lambda (region)
+                                      (semext--region-contains-p region (point)))
+                                    semext--processed-regions)))
+      (when current-region
+        ;; Check if we're near the end of the region
+        (let ((lines-to-end 0)
+              (end-pos (cdr current-region)))
+          (save-excursion
+            (while (and (< (point) end-pos)
+                        (< lines-to-end semext-preload-threshold))
+              (forward-line 1)
+              (setq lines-to-end (1+ lines-to-end))))
+
+          ;; If we're within threshold lines of the end, load next chunk
+          (when (< lines-to-end semext-preload-threshold)
+            (let* ((next-start (max (point)
+                                    (- end-pos (* semext-chunk-overlap (average-line-length)))))
+                   (next-bounds (semext--get-chunk-bounds next-start))
+                   (next-end (cdr next-bounds)))
+              (unless (semext--point-in-processed-region-p next-end)
+                (semext--populate-parts-for-region next-start next-end)))))))))
+
+(defun average-line-length ()
+  "Calculate the average length of lines in characters."
+  (/ (- (point-max) (point-min)) (line-number-at-pos (point-max))))
 
 (defun semext--part-markers ()
   "Return `semext--part-markers', populating it if necessary."
-  (or semext--part-markers
+  (semext--maybe-load-next-chunk)
+  (if (semext--point-in-processed-region-p (point))
+      ;; We're in a processed region, return markers
       (progn
-        (semext--populate-parts)
-        (while (null semext--part-markers)
-          (sit-for 0.1))
-        semext--part-markers)))
+        (when (null semext--part-markers)
+          (message "No semantic parts found in processed regions"))
+        semext--part-markers)
+    ;; We're not in a processed region, populate it
+    (message "Populating semantic parts for current region...")
+    (semext--populate-parts)
+    ;; Wait with a timeout
+    (let ((timeout 30)  ;; 30 seconds timeout
+          (waited 0))
+      (while (and semext--processing-in-progress
+                  (< waited timeout))
+        (sit-for 0.1)
+        (setq waited (+ waited 0.1)))
+      (if (not (semext--point-in-processed-region-p (point)))
+          (progn
+            (message "Timed out or failed to process current region")
+            ;; Return whatever markers we have
+            semext--part-markers)
+        (message "Region processed, found %d total semantic parts"
+                 (length semext--part-markers))
+        semext--part-markers))))
 
 (defun semext-forward-part (&optional n)
-  "Move point forward to the beginning of the next part."
+  "Move point forward to the beginning of the next part.
+With prefix argument N, move forward N parts."
   (interactive "p")
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
+  (setq n (or n 1))
   (let* ((markers (semext--part-markers))
-         (next-marker (seq-find (lambda (marker) (> marker (point)))
-                                markers)))
-    (when next-marker
-      (goto-char next-marker))))
+         (next-markers (seq-filter (lambda (marker) (> marker (point)))
+                                   markers)))
+    (when (and next-markers (> (length next-markers) 0))
+      (if (<= n (length next-markers))
+          (goto-char (nth (1- n) next-markers))
+        (goto-char (car (last next-markers)))))))
 
 (defun semext-backward-part (&optional n)
-  "Move point backward to the beginning of the previous part."
+  "Move point backward to the beginning of the previous part.
+With prefix argument N, move backward N parts."
   (interactive "p")
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
+  (setq n (or n 1))
   (let* ((markers (semext--part-markers))
-         (prev-marker (seq-find (lambda (marker) (< marker (point)))
-                                (reverse markers))))
-    (when prev-marker
-      (goto-char prev-marker))))
+         (prev-markers (seq-filter (lambda (marker) (< marker (point)))
+                                   (reverse markers))))
+    (when (and prev-markers (> (length prev-markers) 0))
+      (if (<= n (length prev-markers))
+          (goto-char (nth (1- n) prev-markers))
+        (goto-char (car (last prev-markers)))))))
+
+(defun semext-clear-cache ()
+  "Clear all cached semantic parts and processed regions."
+  (interactive)
+  (setq semext--part-markers nil
+        semext--processed-regions nil
+        semext--processing-in-progress nil)
+  (message "Semantic parts cache cleared"))
 
 (provide 'semext)
 ;;; semext.el ends here
