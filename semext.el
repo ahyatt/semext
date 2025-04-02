@@ -72,7 +72,7 @@ Return the result as a JSON object."
                                             :required  ["parts"])
   "The JSON schema we expect to get back for finding semantic parts.")
 
-(defconst semext--search-replace-prompt "You will be given the contents of an Emacs buffer and a search/replace request.
+(defconst semext--query-replace-prompt "You will be given the contents of an Emacs buffer and a search/replace request.
 Identify all occurrences matching the search description. For each
 occurrence, specify the exact start and end location and the text to
 replace it with, based on the replacement description.  The
@@ -85,22 +85,22 @@ at `end_line_nume`.  The end point is at the last of those characters.
 Return the result as a JSON object."
   "The prompt to use for semantic search and replace.")
 
-(defconst semext--search-replace-json-schema '(:type object
-                                                     :properties
-                                                     (:replacements
-                                                      (:type array
-                                                             :items
-                                                             (:type object
-                                                                    :properties
-                                                                    (:start_line_num (:type integer)
-                                                                                     :start_chars (:type string)
-                                                                                     :end_line_num (:type integer)
-                                                                                     :end_chars (:type string)
-                                                                                     :replacement_text (:type string))
-                                                                    :required ["start_line_num" "start_chars" "end_line_num" "end_chars" "replacement_text"]
-                                                                    :additionalProperties :json-false)))
-                                                     :additionalProperties :json-false
-                                                     :required ["replacements"])
+(defconst semext--query-replace-json-schema '(:type object
+                                                    :properties
+                                                    (:replacements
+                                                     (:type array
+                                                            :items
+                                                            (:type object
+                                                                   :properties
+                                                                   (:start_line_num (:type integer)
+                                                                                    :start_chars (:type string)
+                                                                                    :end_line_num (:type integer)
+                                                                                    :end_chars (:type string)
+                                                                                    :replacement_text (:type string))
+                                                                   :required ["start_line_num" "start_chars" "end_line_num" "end_chars" "replacement_text"]
+                                                                   :additionalProperties :json-false)))
+                                                    :additionalProperties :json-false
+                                                    :required ["replacements"])
   "The JSON schema for semantic search and replace responses.")
 
 
@@ -387,7 +387,7 @@ With prefix argument N, move backward N parts."
       (backward-char (length chars))
       (point))))
 
-(defun semext-search-replace (search-query replace-query)
+(defun semext-query-replace (search-query replace-query)
   "Perform semantic search for SEARCH-QUERY and replace with REPLACE-QUERY.
 This operates on the current chunk around the point."
   (interactive "sSearch query: \nsReplace query: ")
@@ -398,11 +398,11 @@ This operates on the current chunk around the point."
          (start (car bounds))
          (end (cdr bounds))
          (prompt (format "%s\n\nSearch Description: %s\nReplacement Description: %s"
-                         semext--search-replace-prompt search-query replace-query)))
+                         semext--query-replace-prompt search-query replace-query)))
     (semext--process-buffer-region
      start end
      prompt
-     semext--search-replace-json-schema
+     semext--query-replace-json-schema
      ;; Success callback
      (lambda (json-data start-line-num)
        (let ((replacements (plist-get json-data :replacements))
