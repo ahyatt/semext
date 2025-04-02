@@ -406,11 +406,12 @@ This operates on the current chunk around the point."
      ;; Success callback
      (lambda (json-data start-line-num)
        (let ((replacements (plist-get json-data :replacements))
+             (marker-pairs nil) ; List to store (start-marker end-marker replacement-text)
              (applied-count 0))
          (if (not replacements)
              (message "LLM did not identify any replacements.")
-           ;; Process replacements in reverse order to avoid position shifts
-           (dolist (rep (reverse replacements))
+           ;; 1. Calculate all points and create markers first (forward order)
+           (dolist (rep replacements)
              (let* ((rep-start-line (+ (1- start-line-num) (plist-get rep :start_line_num)))
                     (rep-start-chars (plist-get rep :start_chars))
                     (rep-end-line (+ (1- start-line-num) (plist-get rep :end_line_num)))
@@ -419,14 +420,37 @@ This operates on the current chunk around the point."
                     (start-point (semext--find-point-from-line-chars rep-start-line rep-start-chars))
                     (end-point (save-excursion
                                  (when-let ((p (semext--find-point-from-line-chars rep-end-line rep-end-chars)))
-                                   (+ p (length rep-end-chars))))))
+                                   (when p (+ p (length rep-end-chars)))))))
                (when (and start-point end-point (> end-point start-point))
-                 (save-excursion
-                   (goto-char start-point)
-                   (delete-region start-point end-point)
-                   (insert replacement-text))
-                 (setq applied-count (1+ applied-count)))))
-           (message "Applied %d replacements." applied-count))))
+                 (push (list (copy-marker start-point)
+                             (copy-marker end-point)
+                             replacement-text)
+                       marker-pairs))))
+           ;; Markers created, now process interactively (reverse marker-pairs to process in buffer order)
+           (setq marker-pairs (nreverse marker-pairs))
+           (dolist (pair marker-pairs)
+             (let ((start-marker (nth 0 pair))
+                   (end-marker (nth 1 pair))
+                   (replacement-text (nth 2 pair)))
+               (when (and (marker-position start-marker) (marker-position end-marker)) ; Check if markers are still valid
+                 (goto-char (marker-position start-marker))
+                 (push-mark (marker-position end-marker) t t) ; Highlight region
+                 (let ((original-text (buffer-substring-no-properties
+                                       (marker-position start-marker)
+                                       (marker-position end-marker))))
+                   (if (y-or-n-p (format "Replace '%s' with '%s'? "
+                                         (truncate-string-to-width original-text 40 nil nil "...")
+                                         (truncate-string-to-width replacement-text 40 nil nil "...")))
+                       (progn
+                         (delete-region (marker-position start-marker) (marker-position end-marker))
+                         (insert replacement-text)
+                         (setq applied-count (1+ applied-count)))))
+                 ;; Ensure mark is deactivated regardless of user choice
+                 (deactivate-mark))
+               ;; Clean up markers after processing
+               (set-marker start-marker nil)
+               (set-marker end-marker nil)))
+           (message "Finished query-replace. Applied %d replacements." applied-count))))
      ;; Error callback
      (lambda (err)
        (message "Error during semantic search/replace: %s" err))
