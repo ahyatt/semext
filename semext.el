@@ -143,6 +143,16 @@ Each element is a cons cell (START . END) representing buffer positions.")
 (defvar-local semext--processing-in-progress nil
   "Non-nil when a chunk is currently being processed.")
 
+;; State for multi-chunk operations
+(defvar-local semext--aggregated-results nil
+  "List to store results aggregated across multiple chunks.")
+(defvar-local semext--last-processed-end-point nil
+  "The end point of the last chunk processed during a multi-chunk operation.")
+(defvar-local semext--active-operation-finalizer nil
+  "The function to call once all chunks have been processed.")
+(defvar-local semext--active-operation-error-prefix nil
+  "The error prefix for the currently active multi-chunk operation.")
+
 (defun semext--buffer-text (&optional start end)
   "Return the buffer text with line numbers prepended to each line.
 If START and END are provided, only return text between those positions."
@@ -416,56 +426,140 @@ With prefix argument N, move backward N parts."
       (backward-char (length chars))
       (point))))
 
-(defun semext--perform-search-action (prompt schema success-callback error-message-prefix)
-  "Perform a semantic search action using the LLM.
-Handles provider check, chunk bounds, and async call setup.
-PROMPT: The full prompt string for the LLM.
+(defun semext--perform-search-action (prompt schema finalizer-callback error-message-prefix)
+  "Initiate a multi-chunk semantic action across the entire buffer.
+Handles provider check, sets up state, and starts processing the first chunk.
+PROMPT: The base prompt string for the LLM (chunk info will be added).
 SCHEMA: The expected JSON schema for the response.
-SUCCESS-CALLBACK: Function to call on successful LLM response.
-  It receives (json-data start-line-num).
+FINALIZER-CALLBACK: Function to call with the aggregated results list
+  once the entire buffer is processed. It receives (results).
 ERROR-MESSAGE-PREFIX: String to prefix error messages with."
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
+  (when semext--active-operation-finalizer
+    (message "Warning: Overwriting an existing semantic operation"))
 
-  (let* ((bounds (semext--get-chunk-bounds (point)))
-         (start (car bounds))
-         (end (cdr bounds)))
-    (semext--process-buffer-region
-     start end
-     prompt
-     schema
-     ;; Pass the user-provided success callback directly
-     success-callback
-     ;; Generic error callback
-     (lambda (err)
-       (message "%s: %s" error-message-prefix err))
-     ;; Context note (common to search/replace)
-     "Note: The line numbers provided are relative to the excerpt you're analyzing.")))
+  ;; Reset state for the new operation
+  (setq semext--aggregated-results nil
+        semext--last-processed-end-point (point-min) ; Start tracking from point-min
+        semext--active-operation-finalizer finalizer-callback
+        semext--active-operation-error-prefix error-message-prefix)
+
+  (message "Starting semantic operation...")
+  ;; Start processing from the beginning of the buffer
+  (semext--process-next-chunk prompt schema))
+
+(defun semext--process-next-chunk (prompt schema)
+  "Calculate bounds for the next chunk starting after the last processed point and call the LLM processor."
+  ;; Calculate next chunk start point considering overlap
+  (let* ((next-chunk-start (max (point-min)
+                                (- semext--last-processed-end-point
+                                   (* semext-chunk-overlap (average-line-length)))))
+         (bounds (semext--get-chunk-bounds next-chunk-start))
+         (chunk-start (car bounds))
+         (chunk-end (cdr bounds)))
+
+    ;; Check if the new chunk start is already beyond the last processed end point.
+    ;; This indicates we've covered the buffer.
+    (if (>= chunk-start semext--last-processed-end-point)
+        ;; If last processed point was already point-max, we are done.
+        ;; Otherwise, if chunk_start >= last_end, and last_end wasn't point_max,
+        ;; it means get-chunk-bounds might have clamped to point-max, process this last chunk.
+        (if (= semext--last-processed-end-point (point-max))
+            (progn ;; Already finished
+              (message "Semantic operation complete (final check).")
+              (funcall semext--active-operation-finalizer (sort-results semext--aggregated-results))
+              (setq semext--active-operation-finalizer nil)) ;; Clear state
+          ;; Process the potentially final chunk
+          (semext--process-buffer-region-wrapper chunk-start chunk-end prompt schema))
+      ;; Process the calculated chunk
+      (semext--process-buffer-region-wrapper chunk-start chunk-end prompt schema))))
+
+
+(defun semext--process-buffer-region-wrapper (chunk-start chunk-end prompt schema)
+  "Wrapper to call semext--process-buffer-region with the chunk-aware callback."
+  (semext--process-buffer-region
+   chunk-start chunk-end
+   prompt schema
+   ;; Success callback - pass chunk_end along
+   (lambda (json-data start-line-num)
+     (semext--handle-chunk-response json-data start-line-num chunk-end prompt schema))
+   ;; Error callback
+   (lambda (err)
+     (message "%s: %s" semext--active-operation-error-prefix err)
+     (setq semext--active-operation-finalizer nil)) ; Clear state on error
+   ;; Context note
+   "Note: The line numbers provided are relative to the excerpt you're analyzing."))
+
+
+(defun semext--handle-chunk-response (json-data start-line-num chunk-end prompt schema)
+  "Handle the response for a single chunk, aggregate results, and trigger next chunk or finalizer."
+  ;; Process results for this chunk
+  (let ((new-results (if (plist-member json-data :replacements)
+                         (semext--process-query-replace-results json-data start-line-num)
+                       (semext--process-search-results json-data start-line-num))))
+    (when new-results
+      ;; Append new results, ensuring no duplicates if chunks overlap significantly
+      ;; Simple append might duplicate results in overlapping regions.
+      ;; Let's filter duplicates based on start point before appending.
+      (let ((existing-starts (cl-loop for res in semext--aggregated-results
+                                      collect (if (consp res) (car res) (plist-get res :start)))))
+        (setq new-results (seq-filter (lambda (res)
+                                        (not (member (if (consp res) (car res) (plist-get res :start))
+                                                     existing-starts)))
+                                      new-results)))
+      (setq semext--aggregated-results (append semext--aggregated-results new-results))))
+
+  ;; Update the point up to which we have processed
+  (setq semext--last-processed-end-point (max semext--last-processed-end-point chunk-end))
+
+  ;; Check if we've processed the entire buffer
+  (if (< semext--last-processed-end-point (point-max))
+      ;; More buffer to process, trigger next chunk
+      (progn
+        (message "Processed up to line %d. Requesting next chunk..." (line-number-at-pos semext--last-processed-end-point))
+        (semext--process-next-chunk prompt schema))
+    ;; End of buffer reached, call the finalizer
+    (message "Semantic operation complete.")
+    (funcall semext--active-operation-finalizer (sort-results semext--aggregated-results))
+    ;; Clear state
+    (setq semext--active-operation-finalizer nil
+          semext--aggregated-results nil
+          semext--last-processed-end-point nil
+          semext--active-operation-error-prefix nil)))
+
+;; Helper to sort results consistently (by start point)
+(defun sort-results (results)
+  "Sort RESULTS list. Assumes list of plists with :start or cons cells."
+  (when results
+    (sort results (lambda (a b)
+                    (let ((start-a (if (consp a) (car a) (plist-get a :start)))
+                          (start-b (if (consp b) (car b) (plist-get b :start))))
+                      (< start-a start-b))))))
 
 (defun semext-query-replace (search-query replace-query)
   "Perform semantic search for SEARCH-QUERY and replace with REPLACE-QUERY.
-This operates on the current chunk around the point."
+Processes the entire buffer chunk by chunk, then interactively asks for each replacement."
   (interactive "sSearch query: \nsReplace query: ")
   (let ((prompt (format "%s\n\nSearch Description: %s\nReplacement Description: %s"
                         semext--query-replace-prompt search-query replace-query)))
     (semext--perform-search-action
      prompt
      semext--query-replace-json-schema
-     ;; Success callback
-     (lambda (json-data start-line-num)
-       (let* ((results (semext--process-query-replace-results json-data start-line-num))
-              (marker-pairs nil) ; List to store (start-marker end-marker replacement-text)
-              (applied-count 0))
-         (if (not results)
-             (message "LLM did not identify any replacements.")
-           ;; 1. Create markers from results
-           (dolist (res results)
+     ;; Finalizer callback (runs after all chunks are processed)
+     (lambda (all-results)
+       (let ((marker-pairs nil) ; List to store (start-marker end-marker replacement-text)
+             (applied-count 0))
+         (if (not all-results)
+             (message "LLM did not identify any replacements in the buffer.")
+           ;; 1. Create markers from aggregated results
+           (dolist (res all-results)
              (push (list (copy-marker (plist-get res :start))
                          (copy-marker (plist-get res :end))
                          (plist-get res :replacement))
                    marker-pairs))
-           ;; Markers created, now process interactively (reverse marker-pairs to process in buffer order)
-           (setq marker-pairs (nreverse marker-pairs)) ; Already in buffer order from processor
+           ;; Markers created, now process interactively (results are already sorted)
+           (setq marker-pairs (nreverse marker-pairs)) ; Reverse push order to get buffer order
            (dolist (pair marker-pairs)
              (let ((start-marker (nth 0 pair))
                    (end-marker (nth 1 pair))
@@ -490,7 +584,7 @@ This operates on the current chunk around the point."
                (set-marker end-marker nil)))
            (message "Finished query-replace. Applied %d replacements." applied-count))))
      ;; Error message prefix
-     "Error during semantic search/replace")))
+     "Error during semantic query-replace")))
 
 (defun semext--process-query-replace-results (json-data start-line-num)
   "Process JSON query-replace results and return a list of plists.
@@ -537,53 +631,52 @@ START-LINE-NUM is the starting line number of the processed chunk."
     (sort point-pairs (lambda (a b) (< (car a) (car b))))))
 
 (defun semext-search-forward (search-query)
-  "Perform semantic search forward for SEARCH-QUERY.
-Moves point to the start and highlights the found occurrence.
-Operates on the current chunk around the point."
+  "Perform semantic search forward for SEARCH-QUERY across the entire buffer.
+Processes the buffer chunk by chunk, then moves point to the first
+occurrence after the initial point and highlights it."
   (interactive "sSearch forward: ")
-  (let ((current-point (point))
+  (let ((original-point (point))
         (prompt (format "%s\n\nSearch Description: %s"
                         semext--search-prompt search-query)))
     (semext--perform-search-action
      prompt
      semext--search-json-schema
-     ;; Success callback
-     (lambda (json-data start-line-num)
-       (let* ((point-pairs (semext--process-search-results json-data start-line-num))
-              (found-pair (seq-find (lambda (pair) (> (car pair) current-point))
-                                    point-pairs)))
+     ;; Finalizer callback
+     (lambda (all-results)
+       (let* (;; Results are already sorted by start point
+              (found-pair (seq-find (lambda (pair) (> (car pair) original-point))
+                                    all-results)))
          (if found-pair
              (progn
                (goto-char (car found-pair))
                (push-mark (cdr found-pair) t t)
                (message "Found occurrence forward"))
-           (message "Search forward failed: No further occurrences found in this chunk"))))
+           (message "Search forward failed: No further occurrences found"))))
      ;; Error message prefix
      "Error during semantic search forward")))
 
 (defun semext-search-backward (search-query)
-  "Perform semantic search backward for SEARCH-QUERY.
-Moves point to the start and highlights the found occurrence.
-Operates on the current chunk around the point."
+  "Perform semantic search backward for SEARCH-QUERY across the entire buffer.
+Processes the buffer chunk by chunk, then moves point to the first
+occurrence ending before the initial point and highlights it."
   (interactive "sSearch backward: ")
-  (let ((current-point (point))
+  (let ((original-point (point))
         (prompt (format "%s\n\nSearch Description: %s"
                         semext--search-prompt search-query)))
     (semext--perform-search-action
      prompt
      semext--search-json-schema
-     ;; Success callback
-     (lambda (json-data start-line-num)
-       (let* ((point-pairs (semext--process-search-results json-data start-line-num))
-              ;; Find the last pair whose end point is before the current point
-              (found-pair (car (seq-filter (lambda (pair) (< (cdr pair) current-point))
-                                           (reverse point-pairs))))) ; Reverse to find last easily
+     ;; Finalizer callback
+     (lambda (all-results)
+       (let* (;; Results are sorted. Find the last one ending before original-point.
+              (found-pair (car (seq-filter (lambda (pair) (< (cdr pair) original-point))
+                                           (reverse all-results))))) ; Reverse sorted list to find last easily
          (if found-pair
              (progn
                (goto-char (car found-pair))
                (push-mark (cdr found-pair) t t)
                (message "Found occurrence backward"))
-           (message "Search backward failed: No previous occurrences found in this chunk"))))
+           (message "Search backward failed: No previous occurrences found"))))
      ;; Error message prefix
      "Error during semantic search backward")))
 
