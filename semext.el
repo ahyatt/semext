@@ -103,6 +103,35 @@ Return the result as a JSON object."
                                                     :required ["replacements"])
   "The JSON schema for semantic search and replace responses.")
 
+(defconst semext--search-prompt "You will be given the contents of an Emacs buffer and a search description.
+Identify all occurrences matching the search description. For each
+occurrence, specify the exact start and end location. The `start_chars`
+is the first few characters (enough to be unique) occuring at
+`start_line_num` that start the location. The start point is the beginning
+of those characters. The `end_chars` is the last few characters (again,
+enough to be unique), that end the location, occuring at `end_line_num`.
+The end point is at the last of those characters.
+
+Return the result as a JSON object."
+  "The prompt to use for semantic search.")
+
+(defconst semext--search-json-schema '(:type object
+                                             :properties
+                                             (:occurrences
+                                              (:type array
+                                                     :items
+                                                     (:type object
+                                                            :properties
+                                                            (:start_line_num (:type integer)
+                                                                             :start_chars (:type string)
+                                                                             :end_line_num (:type integer)
+                                                                             :end_chars (:type string))
+                                                            :required ["start_line_num" "start_chars" "end_line_num" "end_chars"]
+                                                            :additionalProperties :json-false)))
+                                             :additionalProperties :json-false
+                                             :required ["occurrences"])
+  "The JSON schema for semantic search responses.")
+
 
 (defvar-local semext--part-markers nil
   "The stored markers representing the start of semantic parts in the buffer.")
@@ -387,47 +416,56 @@ With prefix argument N, move backward N parts."
       (backward-char (length chars))
       (point))))
 
-(defun semext-query-replace (search-query replace-query)
-  "Perform semantic search for SEARCH-QUERY and replace with REPLACE-QUERY.
-This operates on the current chunk around the point."
-  (interactive "sSearch query: \nsReplace query: ")
+(defun semext--perform-search-action (prompt schema success-callback error-message-prefix)
+  "Perform a semantic search action using the LLM.
+Handles provider check, chunk bounds, and async call setup.
+PROMPT: The full prompt string for the LLM.
+SCHEMA: The expected JSON schema for the response.
+SUCCESS-CALLBACK: Function to call on successful LLM response.
+  It receives (json-data start-line-num).
+ERROR-MESSAGE-PREFIX: String to prefix error messages with."
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
 
   (let* ((bounds (semext--get-chunk-bounds (point)))
          (start (car bounds))
-         (end (cdr bounds))
-         (prompt (format "%s\n\nSearch Description: %s\nReplacement Description: %s"
-                         semext--query-replace-prompt search-query replace-query)))
+         (end (cdr bounds)))
     (semext--process-buffer-region
      start end
+     prompt
+     schema
+     ;; Pass the user-provided success callback directly
+     success-callback
+     ;; Generic error callback
+     (lambda (err)
+       (message "%s: %s" error-message-prefix err))
+     ;; Context note (common to search/replace)
+     "Note: The line numbers provided are relative to the excerpt you're analyzing.")))
+
+(defun semext-query-replace (search-query replace-query)
+  "Perform semantic search for SEARCH-QUERY and replace with REPLACE-QUERY.
+This operates on the current chunk around the point."
+  (interactive "sSearch query: \nsReplace query: ")
+  (let ((prompt (format "%s\n\nSearch Description: %s\nReplacement Description: %s"
+                        semext--query-replace-prompt search-query replace-query)))
+    (semext--perform-search-action
      prompt
      semext--query-replace-json-schema
      ;; Success callback
      (lambda (json-data start-line-num)
-       (let ((replacements (plist-get json-data :replacements))
-             (marker-pairs nil) ; List to store (start-marker end-marker replacement-text)
-             (applied-count 0))
-         (if (not replacements)
+       (let* ((results (semext--process-query-replace-results json-data start-line-num))
+              (marker-pairs nil) ; List to store (start-marker end-marker replacement-text)
+              (applied-count 0))
+         (if (not results)
              (message "LLM did not identify any replacements.")
-           ;; 1. Calculate all points and create markers first (forward order)
-           (dolist (rep replacements)
-             (let* ((rep-start-line (+ (1- start-line-num) (plist-get rep :start_line_num)))
-                    (rep-start-chars (plist-get rep :start_chars))
-                    (rep-end-line (+ (1- start-line-num) (plist-get rep :end_line_num)))
-                    (rep-end-chars (plist-get rep :end_chars))
-                    (replacement-text (plist-get rep :replacement_text))
-                    (start-point (semext--find-point-from-line-chars rep-start-line rep-start-chars))
-                    (end-point (save-excursion
-                                 (when-let ((p (semext--find-point-from-line-chars rep-end-line rep-end-chars)))
-                                   (when p (+ p (length rep-end-chars)))))))
-               (when (and start-point end-point (> end-point start-point))
-                 (push (list (copy-marker start-point)
-                             (copy-marker end-point)
-                             replacement-text)
-                       marker-pairs))))
+           ;; 1. Create markers from results
+           (dolist (res results)
+             (push (list (copy-marker (plist-get res :start))
+                         (copy-marker (plist-get res :end))
+                         (plist-get res :replacement))
+                   marker-pairs))
            ;; Markers created, now process interactively (reverse marker-pairs to process in buffer order)
-           (setq marker-pairs (nreverse marker-pairs))
+           (setq marker-pairs (nreverse marker-pairs)) ; Already in buffer order from processor
            (dolist (pair marker-pairs)
              (let ((start-marker (nth 0 pair))
                    (end-marker (nth 1 pair))
@@ -451,11 +489,103 @@ This operates on the current chunk around the point."
                (set-marker start-marker nil)
                (set-marker end-marker nil)))
            (message "Finished query-replace. Applied %d replacements." applied-count))))
-     ;; Error callback
-     (lambda (err)
-       (message "Error during semantic search/replace: %s" err))
-     ;; Context note
-     "Note: The line numbers provided are relative to the excerpt you're analyzing.")))
+     ;; Error message prefix
+     "Error during semantic search/replace")))
+
+(defun semext--process-query-replace-results (json-data start-line-num)
+  "Process JSON query-replace results and return a list of plists.
+Each plist is (:start START :end END :replacement TEXT).
+START-LINE-NUM is the starting line number of the processed chunk."
+  (let ((replacements (plist-get json-data :replacements))
+        (results nil))
+    (when replacements
+      (dolist (rep replacements)
+        (let* ((rep-start-line (+ (1- start-line-num) (plist-get rep :start_line_num)))
+               (rep-start-chars (plist-get rep :start_chars))
+               (rep-end-line (+ (1- start-line-num) (plist-get rep :end_line_num)))
+               (rep-end-chars (plist-get rep :end_chars))
+               (replacement-text (plist-get rep :replacement_text))
+               (start-point (semext--find-point-from-line-chars rep-start-line rep-start-chars))
+               (end-point (save-excursion
+                            (when-let ((p (semext--find-point-from-line-chars rep-end-line rep-end-chars)))
+                              (when p (+ p (length rep-end-chars)))))))
+          (when (and start-point end-point (> end-point start-point))
+            (push (list :start start-point :end end-point :replacement replacement-text)
+                  results)))))
+    ;; Return in buffer order (reverse the pushed list)
+    (nreverse results)))
+
+
+(defun semext--process-search-results (json-data start-line-num)
+  "Process JSON search results and return a sorted list of (START . END) point pairs.
+START-LINE-NUM is the starting line number of the processed chunk."
+  (let ((occurrences (plist-get json-data :occurrences))
+        (point-pairs nil))
+    (when occurrences
+      (dolist (occ occurrences)
+        (let* ((occ-start-line (+ (1- start-line-num) (plist-get occ :start_line_num)))
+               (occ-start-chars (plist-get occ :start_chars))
+               (occ-end-line (+ (1- start-line-num) (plist-get occ :end_line_num)))
+               (occ-end-chars (plist-get occ :end_chars))
+               (start-point (semext--find-point-from-line-chars occ-start-line occ-start-chars))
+               (end-point (save-excursion
+                            (when-let ((p (semext--find-point-from-line-chars occ-end-line occ-end-chars)))
+                              (when p (+ p (length occ-end-chars)))))))
+          (when (and start-point end-point (> end-point start-point))
+            (push (cons start-point end-point) point-pairs)))))
+    ;; Sort by start point
+    (sort point-pairs (lambda (a b) (< (car a) (car b))))))
+
+(defun semext-search-forward (search-query)
+  "Perform semantic search forward for SEARCH-QUERY.
+Moves point to the start and highlights the found occurrence.
+Operates on the current chunk around the point."
+  (interactive "sSearch forward: ")
+  (let ((current-point (point))
+        (prompt (format "%s\n\nSearch Description: %s"
+                        semext--search-prompt search-query)))
+    (semext--perform-search-action
+     prompt
+     semext--search-json-schema
+     ;; Success callback
+     (lambda (json-data start-line-num)
+       (let* ((point-pairs (semext--process-search-results json-data start-line-num))
+              (found-pair (seq-find (lambda (pair) (> (car pair) current-point))
+                                    point-pairs)))
+         (if found-pair
+             (progn
+               (goto-char (car found-pair))
+               (push-mark (cdr found-pair) t t)
+               (message "Found occurrence forward"))
+           (message "Search forward failed: No further occurrences found in this chunk"))))
+     ;; Error message prefix
+     "Error during semantic search forward")))
+
+(defun semext-search-backward (search-query)
+  "Perform semantic search backward for SEARCH-QUERY.
+Moves point to the start and highlights the found occurrence.
+Operates on the current chunk around the point."
+  (interactive "sSearch backward: ")
+  (let ((current-point (point))
+        (prompt (format "%s\n\nSearch Description: %s"
+                        semext--search-prompt search-query)))
+    (semext--perform-search-action
+     prompt
+     semext--search-json-schema
+     ;; Success callback
+     (lambda (json-data start-line-num)
+       (let* ((point-pairs (semext--process-search-results json-data start-line-num))
+              ;; Find the last pair whose end point is before the current point
+              (found-pair (car (seq-filter (lambda (pair) (< (cdr pair) current-point))
+                                           (reverse point-pairs))))) ; Reverse to find last easily
+         (if found-pair
+             (progn
+               (goto-char (car found-pair))
+               (push-mark (cdr found-pair) t t)
+               (message "Found occurrence backward"))
+           (message "Search backward failed: No previous occurrences found in this chunk"))))
+     ;; Error message prefix
+     "Error during semantic search backward")))
 
 
 (defun semext-clear-cache ()
