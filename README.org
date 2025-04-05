@@ -1,0 +1,27 @@
+#+TITLE: Semext - LLM-powed SEMantic EXTensions for Emacs
+
+* Installation
+#+begin_src emacs-lisp
+(use-package semext
+  :vc (:fetcher github :repo "ahyatt/semext")
+  :init
+  ;; Replace provider with whatever you want, see https://github.com/ahyatt/llm
+  (setopt semext-provider (make-llm-ollama :chat-model "gemma3:1b")))
+#+end_src
+
+* Usage
+This library integrates Emacs with LLMs to provide functionality that is close to what Emacs already has, but more flexible and powerful since it is driven by LLMs.  While it is powerful and in many cases much easier to use than the non-LLM powered equivalents, the downside is that it is also slower and not predictable.
+
+The following commands are supported:
+
+- =semext-forward-part=, =semext-backward-part=. Similar in spirit to =forward-page= and =backward-page=, these commands ask the LLM to identify significant semantic parts of the buffer (like functions, sections, or important paragraphs) and navigate between them. The parts are computed on demand across the entire buffer each time the command is run.
+- =semext-query-replace=. Similar to =query-replace=, this finds text matching a semantic description provided by the user and interactively asks whether to replace it based on a replacement description. It processes the entire buffer before starting the interactive replacement.
+- =semext-search-forward=, =semext-search-backward=. Similar to =search-forward=, these find the next or previous instance of text matching a semantic description provided by the user. They process the entire buffer to find all occurrences before jumping to the relevant one.
+
+* Caveats
+- *Performance*: Since these commands often query an LLM over the entire buffer (in chunks), they can be significantly slower than their built-in Emacs counterparts, especially for large buffers or slow LLM providers.
+- *Consistency*: LLMs operate on fixed-size context windows. While =semext= processes the buffer in overlapping chunks, there might still be inconsistencies in how the LLM interprets boundaries or context across very large distances in the buffer.
+- *Provider Choice*: A fast LLM provider capable of handling JSON responses is recommended (see =semext-provider=).
+
+There are no mode requirements for any command. They operate in any mode.
+
