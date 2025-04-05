@@ -19,9 +19,17 @@ The following commands are supported:
 - =semext-search-forward=, =semext-search-backward=. Similar to =search-forward=, these find the next or previous instance of text matching a semantic description provided by the user. They process the entire buffer to find all occurrences before jumping to the relevant one.
 
 * Caveats
-- *Performance*: Since these commands often query an LLM over the entire buffer (in chunks), they can be significantly slower than their built-in Emacs counterparts, especially for large buffers or slow LLM providers.
-- *Consistency*: LLMs operate on fixed-size context windows. While =semext= processes the buffer in overlapping chunks, there might still be inconsistencies in how the LLM interprets boundaries or context across very large distances in the buffer.
+- *Performance*: The first time a command like =semext-search-forward= or =semext-forward-part= is run, it queries the LLM over the entire buffer (in chunks), which can be slow. Subsequent calls for the same operation (e.g., searching for the same text again, or moving to the next part) will be much faster as they use a cache.
+- *Caching*: Results are cached locally for each buffer. The cache is automatically invalidated if the text at a cached location changes. You can manually clear the cache using =M-x semext-clear-cache=.
+- *Consistency*: LLMs operate on fixed-size context windows. While =semext= processes the buffer in overlapping chunks, there might still be inconsistencies in how the LLM interprets boundaries or context across very large distances in the buffer, especially during the initial LLM query.
 - *Provider Choice*: A fast LLM provider capable of handling JSON responses is recommended (see =semext-provider=).
 
 There are no mode requirements for any command. They operate in any mode.
+
+* Commands
+
+- =semext-forward-part=, =semext-backward-part=: Navigate between semantic parts identified by the LLM. Uses cache after first run.
+- =semext-query-replace=: Semantic query-replace. Uses cache after first run for a specific query.
+- =semext-search-forward=, =semext-search-backward=: Semantic search. Uses cache after first run for a specific query.
+- =semext-clear-cache=: Manually clear the results cache for the current buffer.
 
