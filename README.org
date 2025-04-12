@@ -1,5 +1,16 @@
 #+TITLE: Semext - LLM-powed SEMantic EXTensions for Emacs
 
+Semext aims to provide LLM-powered version of Emacs command in ways that feel natural to Emacs users.  The goal is to be as Emacs-like as possible.
+
+* Demo
+An example of searching semantically with =semext-search-forward=:
+
+[[./demos/semext-search-forward]]
+
+Using =semext-query-replace=:
+
+[[./demos/semext-query-replace]]
+
 * Installation
 #+begin_src emacs-lisp
 (use-package semext
