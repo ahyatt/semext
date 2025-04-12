@@ -31,5 +31,5 @@ There are no mode requirements for any command. They operate in any mode.
 - =semext-forward-part=, =semext-backward-part=: Navigate between semantic parts identified by the LLM. Uses cache after first run.
 - =semext-query-replace=: Semantic query-replace. Uses cache after first run for a specific query.
 - =semext-search-forward=, =semext-search-backward=: Semantic search. Uses cache after first run for a specific query.
-- =semext-clear-cache=: Manually clear the results cache for the current buffer.
+- =semext-clear-cache=: Manually clear the entire results cache for the current buffer.
 

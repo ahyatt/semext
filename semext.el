@@ -91,13 +91,14 @@ Return the result as a JSON object."
 
 (defconst semext--query-replace-prompt "You will be given the contents of an Emacs buffer and a search/replace request.
 Identify all occurrences matching the search description. For each
-occurrence, specify the exact start and end location and the text to
-replace it with, based on the replacement description.  The
-`start_chars` is the first few characters (enough to be unique) occuring
-at `start_line_num` that start the location.  The start point is the
-beginning of those characters.  The `end_chars` is the last few
-characters (again, enough to be unique), that end the location, occuring
-at `end_line_num`.  The end point is at the last of those characters.
+occurrence, specify the exact start and end location of the text to
+replace, and the text to replace it with, based on the replacement
+description.  The `start_chars` is the first few characters (enough to
+be unique) occuring at `start_line_num` that start the location that
+will be replaced.  The start point is the beginning of those characters.
+The `end_chars` is the last few characters (again, enough to be unique),
+that end the location, occuring at `end_line_num`.  The end point is at
+the last of those characters.
 
 Return the result as a JSON object."
   "The prompt to use for semantic search and replace.")
@@ -228,10 +229,11 @@ If START and END are provided, only return text between those positions."
 
 (defun semext--process-buffer-region (start end prompt schema success-callback error-callback &optional context-note)
   "Process the buffer region from START to END using the LLM.
-Call LLM with PROMPT and expect response matching SCHEMA.
-On success, call SUCCESS-CALLBACK with the parsed JSON data and START-LINE-NUM.
-On error, call ERROR-CALLBACK with the error message.
-CONTEXT-NOTE is an optional string to add to the prompt context."
+
+Call LLM with PROMPT and expect response matching SCHEMA.  On success,
+call SUCCESS-CALLBACK with the parsed JSON data and START-LINE-NUM.  On
+error, call ERROR-CALLBACK with the error message.  CONTEXT-NOTE is an
+optional string to add to the prompt context."
   ;; Note: This function uses llm-chat-async. If multiple calls overlap,
   ;; the behavior might be unpredictable depending on the provider.
   ;; The current design relies on user interaction flow to prevent overlaps.
@@ -269,7 +271,7 @@ CONTEXT-NOTE is an optional string to add to the prompt context."
      (message "Failed to start LLM request: %s" (error-message-string err))
      (funcall error-callback (error-message-string err)))))
 
-(defun average-line-length ()
+(defun semext--average-line-length ()
   "Calculate the average length of lines in characters."
   (let ((lines (line-number-at-pos (point-max))))
     (if (> lines 0)
@@ -278,8 +280,9 @@ CONTEXT-NOTE is an optional string to add to the prompt context."
 
 (defun semext-forward-part (&optional n)
   "Move point forward to the beginning of the next semantic part.
-With prefix argument N, move forward N parts.
-Parts are computed on demand across the entire buffer or retrieved from cache."
+
+With prefix argument N, move forward N parts.  Parts are computed on
+demand across the entire buffer or retrieved from cache."
   (interactive "p")
   (setq n (or n 1))
   (let ((original-point (point))
@@ -313,8 +316,9 @@ Parts are computed on demand across the entire buffer or retrieved from cache."
 
 (defun semext-backward-part (&optional n)
   "Move point backward to the beginning of the previous semantic part.
-With prefix argument N, move backward N parts.
-Parts are computed on demand across the entire buffer or retrieved from cache."
+
+With prefix argument N, move backward N parts.  Parts are computed on
+demand across the entire buffer or retrieved from cache."
   (interactive "p")
   (setq n (or n 1))
   (let ((original-point (point))
@@ -358,12 +362,19 @@ Parts are computed on demand across the entire buffer or retrieved from cache."
 
 (defun semext--perform-search-action (prompt schema query-details finalizer-callback error-message-prefix)
   "Initiate a multi-chunk semantic action across the entire buffer.
+
 Handles provider check, sets up state, and starts processing the first chunk.
+
 PROMPT: The base prompt string for the LLM (chunk info will be added).
+
 SCHEMA: The expected JSON schema for the response.
-QUERY-DETAILS: Data identifying the specific query (e.g., search string).
+
+QUERY-DETAILS: Data identifying the specific query (e.g., search
+string).
+
 FINALIZER-CALLBACK: Function to call with the aggregated results list
-  once the entire buffer is processed. It receives (results).
+once the entire buffer is processed. It receives (results).
+
 ERROR-MESSAGE-PREFIX: String to prefix error messages with."
   (unless (member 'json-response (llm-capabilities semext-provider))
     (error "semext requires a provider that can do json responses"))
@@ -382,11 +393,14 @@ ERROR-MESSAGE-PREFIX: String to prefix error messages with."
   (semext--process-next-chunk prompt schema))
 
 (defun semext--process-next-chunk (prompt schema)
-  "Calculate bounds for the next chunk starting after the last processed point and call the LLM processor."
+  "Process with PROMPT and SCHEMA the next chunk of text in the buffer.
+
+Calculate bounds for the next chunk starting after the last processed
+point and call the LLM processor."
   ;; Calculate next chunk start point considering overlap
   (let* ((next-chunk-start (max (point-min)
                                 (- semext--last-processed-end-point
-                                   (* semext-chunk-overlap (average-line-length)))))
+                                   (* semext-chunk-overlap (semext--average-line-length)))))
          (bounds (semext--get-chunk-bounds next-chunk-start))
          (chunk-start (car bounds))
          (chunk-end (cdr bounds)))
@@ -425,7 +439,9 @@ ERROR-MESSAGE-PREFIX: String to prefix error messages with."
    "Note: The line numbers provided are relative to the excerpt you're analyzing."))
 
 (defun semext--handle-chunk-response (json-data start-line-num chunk-end prompt schema)
-  "Handle the response for a single chunk, aggregate results, and trigger next chunk or finalizer."
+  "Handle the response for a single chunk.
+
+Aggregate results, and trigger next chunk or finalizer."
   ;; Process results for this chunk based on the response structure
   (let ((new-results (cond ((plist-member json-data :replacements)
                             (semext--process-query-replace-results json-data start-line-num))
@@ -451,7 +467,9 @@ ERROR-MESSAGE-PREFIX: String to prefix error messages with."
           (semext--process-next-chunk prompt schema))
       ;; End of buffer reached, sort, remove duplicates, store in cache, and call the finalizer
       (message "Semantic operation complete.")
-      (let* ((sorted-unique-results (seq-uniq (sort-results semext--aggregated-results)))
+      (let* ((sorted-unique-results (seq-uniq
+                                     (sort semext--aggregated-results
+                                           :key (lambda (x) (plist-get x :start)))))
              ;; Determine cache key based on prompt/schema (needs refinement)
              ;; For now, let's use a simplified key based on operation type derived from schema
              (op-type (cond ((eq schema semext--parts-json-schema) :parts)
@@ -488,7 +506,9 @@ ERROR-MESSAGE-PREFIX: String to prefix error messages with."
          (eq (char-after (marker-position marker)) expected-char))))
 
 (defun semext--validate-cache-entry (cache-entry)
-  "Validate a full cache entry (list of marker pairs/tuples). Return t if all valid."
+  "Validate a full cache entry (list of marker pairs/tuples).
+
+Return t if all valid."
   (cl-every (lambda (item)
               (cond
                ;; Parts: (marker . char)
@@ -509,14 +529,11 @@ ERROR-MESSAGE-PREFIX: String to prefix error messages with."
                (t (error "Unknown cache entry item format: %S" item)))) ; Should not happen
             cache-entry))
 
-(defun semext-clear-cache (&optional key) ; Renamed from internal `semext--clear-cache`
+(defun semext-clear-cache (&optional key)
   "Clear the semext results cache for the current buffer.
-If called interactively with prefix argument, prompts for a specific key to clear.
-Otherwise clears the entire cache for the buffer."
-  ;; Make interactive spec handle prefix arg for specific key clearing
-  (interactive (list (when current-prefix-arg
-                       (read-from-minibuffer "Cache key to clear (leave blank for all): "))))
-  (if (and key (string-empty-p key)) (setq key nil)) ; Treat empty input as clearing all
+If KEY is provided (internally), clear only that entry.
+Interactively, always clears the entire cache."
+  (interactive) ; Always clear the whole cache when called interactively
   (if key
       (remhash key semext--results-cache)
     (clrhash semext--results-cache))
@@ -541,11 +558,11 @@ KEY is (OPERATION-TYPE . QUERY-DETAILS)."
           ;; Invalid, clear this entry and return nil
           (progn
             (message "Semext cache invalidated for key: %S" key)
-            (semext--clear-cache key)
+            (semext-clear-cache key)
             nil))))))
 
 (defun semext--store-results-in-cache (key results)
-  "Process raw RESULTS, create markers/validation data, and store in cache for KEY."
+  "Process raw RESULTS, create markers/validation, store in cache for KEY."
   (let ((cache-entry nil)
         (op-type (car key)))
     (setq cache-entry
@@ -578,19 +595,11 @@ KEY is (OPERATION-TYPE . QUERY-DETAILS)."
       (puthash key cache-entry semext--results-cache)
       (setq semext--cache-last-validated-tick (buffer-modified-tick)))))
 
-;; Helper to sort results consistently (by start point/value)
-(defun sort-results (results)
-  "Sort RESULTS list. Assumes list of points, plists with :start, or cons cells."
-  (when results
-    (let ((is-point-list (numberp (car results))))
-      (sort results (lambda (a b)
-                      (let ((val-a (if is-point-list a (if (consp a) (car a) (plist-get a :start))))
-                            (val-b (if is-point-list b (if (consp b) (car b) (plist-get b :start)))))
-                        (< val-a val-b)))))))
-
 (defun semext-query-replace (search-query replace-query)
   "Perform semantic search for SEARCH-QUERY and replace with REPLACE-QUERY.
-Processes the entire buffer chunk by chunk (or uses cache), then interactively asks for each replacement."
+
+Processes the entire buffer chunk by chunk (or uses cache), then
+interactively asks for each replacement."
   (interactive "sSearch query: \nsReplace query: ")
   (let* ((query-details (format "S:%s R:%s" search-query replace-query)) ; Combine queries for key
          (cache-key (cons :replace query-details))
@@ -658,6 +667,7 @@ Processes the entire buffer chunk by chunk (or uses cache), then interactively a
 
 (defun semext--process-parts-results (json-data start-line-num)
   "Process JSON parts results and return a list of points.
+
 START-LINE-NUM is the starting line number of the processed chunk."
   (let ((parts (plist-get json-data :parts))
         (points nil))
@@ -673,8 +683,9 @@ START-LINE-NUM is the starting line number of the processed chunk."
 
 (defun semext--process-query-replace-results (json-data start-line-num)
   "Process JSON query-replace results and return a list of plists.
-Each plist is (:start START :end END :replacement TEXT).
-START-LINE-NUM is the starting line number of the processed chunk."
+
+Each plist is (:start START :end END :replacement TEXT).  START-LINE-NUM
+is the starting line number of the processed chunk."
   (let ((replacements (plist-get json-data :replacements))
         (results nil))
     (when replacements
@@ -696,6 +707,7 @@ START-LINE-NUM is the starting line number of the processed chunk."
 
 (defun semext--process-search-results (json-data start-line-num)
   "Process JSON search results and return a sorted list of (START . END) point pairs.
+
 START-LINE-NUM is the starting line number of the processed chunk."
   (let ((occurrences (plist-get json-data :occurrences))
         (point-pairs nil))
@@ -716,6 +728,7 @@ START-LINE-NUM is the starting line number of the processed chunk."
 
 (defun semext-search-forward (search-query)
   "Perform semantic search forward for SEARCH-QUERY across the entire buffer.
+
 Processes the buffer chunk by chunk, then moves point to the first
 occurrence after the initial point and highlights it."
   (interactive "sSearch forward: ")
@@ -754,6 +767,7 @@ occurrence after the initial point and highlights it."
 
 (defun semext-search-backward (search-query)
   "Perform semantic search backward for SEARCH-QUERY across the entire buffer.
+
 Processes the buffer chunk by chunk, then moves point to the first
 occurrence ending before the initial point and highlights it."
   (interactive "sSearch backward: ")
