@@ -5,11 +5,13 @@ Semext aims to provide LLM-powered version of Emacs command in ways that feel na
 * Demo
 An example of searching semantically with =semext-search-forward=:
 
-[[./demos/semext-search-forward]]
+#+CAPTION: semext-search-forward demo
+[[./demos/semext-search-forward.gif]]
 
 Using =semext-query-replace=:
 
-[[./demos/semext-query-replace]]
+#+CAPTION: semext-query-replace demo
+[[./demos/semext-query-replace.gif]]
 
 * Installation
 #+begin_src emacs-lisp
