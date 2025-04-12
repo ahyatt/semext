@@ -22,7 +22,7 @@ The following commands are supported:
 - *Performance*: The first time a command like =semext-search-forward= or =semext-forward-part= is run, it queries the LLM over the entire buffer (in chunks), which can be slow. Subsequent calls for the same operation (e.g., searching for the same text again, or moving to the next part) will be much faster as they use a cache.
 - *Caching*: Results are cached locally for each buffer. The cache is automatically invalidated if the text at a cached location changes. You can manually clear the cache using =M-x semext-clear-cache=.
 - *Consistency*: LLMs operate on fixed-size context windows. While =semext= processes the buffer in overlapping chunks, there might still be inconsistencies in how the LLM interprets boundaries or context across very large distances in the buffer, especially during the initial LLM query.
-- *Provider Choice*: A fast LLM provider capable of handling JSON responses is recommended (see =semext-provider=).
+- *Provider Choice*: A LLM provider capable of handling JSON responses is recommended (see =semext-provider=).
 
 There are no mode requirements for any command. They operate in any mode.
 

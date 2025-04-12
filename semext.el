@@ -54,8 +54,12 @@ This helps maintain context between chunks."
 (defvar semext-provider nil
   "The LLM provider to use for semext functionality.
 
-This should be a provider that can do json responses, and is relatively
-fast.")
+This should be a provider that can do json responses, and is both fast
+with good quality.  The following should be non-nil (although it may not
+work on newer models the llm library doesn't know about):
+
+`(member 'json-response (llm-capabilities semext-provider))'
+")
 
 (defconst semext--parts-prompt "You will be given the contents of an Emacs buffer.
 Divide the buffer into meaningful semantic units, relatively
