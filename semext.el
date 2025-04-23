@@ -728,7 +728,7 @@ START-LINE-NUM is the starting line number of the processed chunk."
           (when (and start-point end-point (> end-point start-point))
             (push (cons start-point end-point) point-pairs)))))
     ;; Sort by start point
-    (sort point-pairs (lambda (a b) (< (car a) (car b))))))
+    (sort point-pairs :key #'car)))
 
 (defun semext-search-forward (search-query)
   "Perform semantic search forward for SEARCH-QUERY across the entire buffer.
